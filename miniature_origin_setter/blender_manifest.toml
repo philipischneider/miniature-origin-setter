@@ -1,0 +1,15 @@
+schema_version = "1.0.0"
+
+id = "miniature_origin_setter"
+version = "1.1.0"
+name = "Miniature Origin Setter"
+tagline = "Auto-sets the origin of 3D print miniatures to their base centroid"
+maintainer = "philipischneider"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-2.0-or-later"]
+
+[languages]
+  pt_BR = "Reposiciona automaticamente a origem de miniaturas STL para o centroide da base"
