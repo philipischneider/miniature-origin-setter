@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Miniature Origin Setter",
     "author": "philipischneider",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Miniature",
     "description": (
@@ -87,6 +87,41 @@ def get_bottom_centroid(obj, tolerance):
     avg_x = sum(v.x for v in bottom_verts) / len(bottom_verts)
     avg_y = sum(v.y for v in bottom_verts) / len(bottom_verts)
     return Vector((avg_x, avg_y, min_z))
+
+
+# ---------------------------------------------------------------------------
+# Base bounding-box helper
+# ---------------------------------------------------------------------------
+
+def get_base_extent_1d(obj, base_height, axis):
+    """
+    Retorna (min, max) em espaço mundo ao longo de `axis` ('X' ou 'Y'),
+    considerando apenas os vértices que estão dentro de `base_height` acima
+    do limite inferior do mesh.
+
+    Usado para calcular o bounding box da BASE da miniatura, ignorando braços,
+    armas ou qualquer geometria acima da altura informada.
+    """
+    mesh = obj.data
+    matrix = obj.matrix_world
+
+    world_verts = [(matrix @ v.co) for v in mesh.vertices]
+    if not world_verts:
+        return None
+
+    min_z = min(v.z for v in world_verts)
+    threshold = min_z + base_height
+
+    base_verts = [v for v in world_verts if v.z <= threshold]
+    if not base_verts:
+        base_verts = world_verts
+
+    if axis == 'X':
+        values = [v.x for v in base_verts]
+    else:
+        values = [v.y for v in base_verts]
+
+    return (min(values), max(values))
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +307,123 @@ class MINIATURE_OT_set_origin_multipart(bpy.types.Operator):
 
 
 # ---------------------------------------------------------------------------
+# Operator – distribuição horizontal
+# ---------------------------------------------------------------------------
+
+class MINIATURE_OT_distribute(bpy.types.Operator):
+    """
+    Distribui os meshes selecionados ao longo de um eixo horizontal.
+    O espaçamento é calculado a partir do bounding box da BASE de cada miniatura
+    (vértices dentro de `base_height` acima do limite inferior), não do mesh inteiro.
+    A distância configurada é entre os limites dos bounding boxes, não entre origens.
+    """
+    bl_idname = "miniature.distribute"
+    bl_label = "Distribuir Miniaturas"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    base_height: bpy.props.FloatProperty(
+        name="Altura da Base",
+        description=(
+            "Altura a partir do limite inferior do mesh considerada para calcular "
+            "o bounding box da base. Vértices acima deste valor são ignorados."
+        ),
+        default=5.0,
+        min=0.0001,
+        soft_max=50.0,
+        precision=3,
+        unit='LENGTH',
+    )
+
+    axis: bpy.props.EnumProperty(
+        name="Eixo",
+        description="Eixo ao longo do qual as miniaturas serão distribuídas",
+        items=[
+            ('X', "X", "Distribuir ao longo do eixo X"),
+            ('Y', "Y", "Distribuir ao longo do eixo Y"),
+        ],
+        default='X',
+    )
+
+    gap: bpy.props.FloatProperty(
+        name="Espaçamento",
+        description="Distância entre os limites dos bounding boxes de bases adjacentes",
+        default=5.0,
+        min=0.0,
+        soft_max=100.0,
+        precision=3,
+        unit='LENGTH',
+    )
+
+    start_pos: bpy.props.FloatProperty(
+        name="Posição Inicial",
+        description=(
+            "Posição no eixo escolhido onde o limite inferior do bounding box "
+            "da primeira miniatura será colocado"
+        ),
+        default=0.0,
+        precision=3,
+        unit='LENGTH',
+    )
+
+    def execute(self, context):
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        targets = [o for o in context.selected_objects if o.type == 'MESH']
+        if len(targets) < 2:
+            self.report({'ERROR'}, "Selecione pelo menos 2 meshes para distribuir.")
+            return {'CANCELLED'}
+
+        ax = self.axis.lower()  # 'x' ou 'y'
+
+        # Ordenar pela posição atual no eixo escolhido
+        sorted_objects = sorted(targets, key=lambda o: getattr(o.location, ax))
+
+        # Calcular extents de base para cada objeto
+        extents = {}
+        for obj in sorted_objects:
+            ext = get_base_extent_1d(obj, self.base_height, self.axis)
+            if ext is None:
+                self.report({'WARNING'}, f"'{obj.name}': mesh vazio, ignorado.")
+                continue
+            extents[obj.name] = ext
+
+        # Posicionar cada objeto de forma que os bboxes fiquem adjacentes + gap
+        # offset = distância em espaço mundo entre a origem e o limite mínimo do bbox
+        # Mover obj.location[ax] por (delta) desloca os vértices pelo mesmo delta,
+        # independentemente de rotação/escala (sem parent), porque é translação global.
+        current_edge = self.start_pos
+        placed = 0
+
+        for obj in sorted_objects:
+            if obj.name not in extents:
+                continue
+
+            bbox_min, bbox_max = extents[obj.name]
+            bbox_width = bbox_max - bbox_min
+
+            origin_pos = getattr(obj.location, ax)
+            offset = bbox_min - origin_pos          # bbox_min relativo à origem
+
+            new_origin_pos = current_edge - offset  # faz bbox_min = current_edge
+            setattr(obj.location, ax, new_origin_pos)
+
+            current_edge += bbox_width + self.gap
+            placed += 1
+
+        self.report({'INFO'}, f"{placed} miniatura(s) distribuída(s) ao longo de {self.axis}.")
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        scene = context.scene
+        self.base_height = scene.miniature_base_height
+        self.axis = scene.miniature_distribute_axis
+        self.gap = scene.miniature_distribute_gap
+        self.start_pos = scene.miniature_distribute_start
+        return self.execute(context)
+
+
+# ---------------------------------------------------------------------------
 # Panel
 # ---------------------------------------------------------------------------
 
@@ -327,6 +479,27 @@ class MINIATURE_PT_panel(bpy.types.Panel):
 
         layout.separator()
 
+        # ── Seção: Distribuição ──────────────────────────────────────────────
+        box_dist = layout.box()
+        box_dist.label(text="Distribuir Miniaturas", icon='SORTSIZE')
+
+        col = box_dist.column(align=True)
+        col.prop(scene, "miniature_base_height")
+        col.prop(scene, "miniature_distribute_gap")
+        col.prop(scene, "miniature_distribute_start")
+
+        box_dist.prop(scene, "miniature_distribute_axis", expand=True)
+
+        row = box_dist.row()
+        row.scale_y = 1.4
+        op_dist = row.operator("miniature.distribute", icon='SNAP_INCREMENT')
+        op_dist.base_height = scene.miniature_base_height
+        op_dist.axis = scene.miniature_distribute_axis
+        op_dist.gap = scene.miniature_distribute_gap
+        op_dist.start_pos = scene.miniature_distribute_start
+
+        layout.separator()
+
         # --- Info do objeto ativo ---
         if obj is None:
             layout.label(text="Nenhum objeto ativo", icon='ERROR')
@@ -366,11 +539,52 @@ _scene_props = [
         description="Aplica a operação em todos os meshes selecionados",
         default=False,
     )),
+    ("miniature_base_height", bpy.props.FloatProperty(
+        name="Altura da Base",
+        description=(
+            "Altura a partir do limite inferior considerada para calcular o "
+            "bounding box da base. Vértices acima deste valor são ignorados."
+        ),
+        default=5.0,
+        min=0.0001,
+        soft_max=50.0,
+        precision=3,
+        unit='LENGTH',
+    )),
+    ("miniature_distribute_axis", bpy.props.EnumProperty(
+        name="Eixo",
+        description="Eixo ao longo do qual as miniaturas serão distribuídas",
+        items=[
+            ('X', "X", "Distribuir ao longo do eixo X"),
+            ('Y', "Y", "Distribuir ao longo do eixo Y"),
+        ],
+        default='X',
+    )),
+    ("miniature_distribute_gap", bpy.props.FloatProperty(
+        name="Espaçamento",
+        description="Distância entre os limites dos bounding boxes de bases adjacentes",
+        default=5.0,
+        min=0.0,
+        soft_max=100.0,
+        precision=3,
+        unit='LENGTH',
+    )),
+    ("miniature_distribute_start", bpy.props.FloatProperty(
+        name="Posição Inicial",
+        description=(
+            "Posição no eixo escolhido onde o limite do bounding box "
+            "da primeira miniatura será colocado"
+        ),
+        default=0.0,
+        precision=3,
+        unit='LENGTH',
+    )),
 ]
 
 _classes = [
     MINIATURE_OT_set_origin,
     MINIATURE_OT_set_origin_multipart,
+    MINIATURE_OT_distribute,
     MINIATURE_PT_panel,
 ]
 
