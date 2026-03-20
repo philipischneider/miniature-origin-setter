@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Miniature Origin Setter",
     "author": "philipischneider",
-    "version": (1, 5, 0),
+    "version": (1, 5, 1),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Miniature",
     "description": (
@@ -660,7 +660,7 @@ class MINIATURE_OT_frame_camera(bpy.types.Operator):
 
         h_fov = 2.0 * math.atan(eff_sw / (2.0 * fl))
 
-        # 4. Extensão horizontal do AABB no eixo cam_x
+        # 4. Verificar extensão horizontal mínima
         right_vals = [c.dot(cam_x) for c in corners]
         half_w = (max(right_vals) - min(right_vals)) / 2.0
 
@@ -668,9 +668,28 @@ class MINIATURE_OT_frame_camera(bpy.types.Operator):
             self.report({'ERROR'}, "Bounding box com largura zero na direção da câmera.")
             return {'CANCELLED'}
 
-        # 5. Distância:  D = half_w / (fill * tan(h_fov/2))
+        # 5. Distância corrigida para perspectiva
+        #
+        # A fórmula ingênua  D = half_w / (fill·tan(h_fov/2))  supõe que todos os
+        # cantos estão à mesma profundidade D.  Na prática os cantos da face mais
+        # próxima da câmera estão a D − Δ e projetam um ângulo MAIOR que o calculado,
+        # fazendo as miniaturas aparecerem cortadas (especialmente grave quando a
+        # extensão ao longo do eixo de visão é grande, como em vistas X com objetos
+        # distribuídos em X).
+        #
+        # Derivação por canto:
+        #   profundidade do canto c = D + (c − bbox_center)·look_dir
+        #   ângulo horizontal       = |cam_x·(c − bbox_center)| / profundidade_c
+        #   para fill:  D ≥ |right_c| / f  −  (c − bbox_center)·look_dir
+        #
+        # O D mínimo que enquadra todos os cantos é o máximo sobre os 8 cantos.
         fill = self.fill_percent / 100.0
-        D = half_w / (fill * math.tan(h_fov / 2.0))
+        f    = fill * math.tan(h_fov / 2.0)
+
+        D = max(
+            abs((c - bbox_center).dot(cam_x)) / f - (c - bbox_center).dot(look_dir)
+            for c in corners
+        )
 
         # 6. Posição: bbox_center recuado D unidades ao longo de look_dir
         camera.location = bbox_center - look_dir * D
