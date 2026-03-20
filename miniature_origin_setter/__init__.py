@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Miniature Origin Setter",
     "author": "philipischneider",
-    "version": (1, 4, 0),
+    "version": (1, 5, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Miniature",
     "description": (
@@ -15,7 +15,7 @@ import math
 
 import bpy
 import bmesh
-from mathutils import Vector
+from mathutils import Matrix, Vector
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +564,18 @@ class MINIATURE_OT_frame_camera(bpy.types.Operator):
         subtype='PERCENTAGE',
     )
 
+    view_axis: bpy.props.EnumProperty(
+        name="Eixo / Lado",
+        description="Lado a partir do qual a câmera verá as miniaturas",
+        items=[
+            ('X_POS', "+X", "Câmera no lado +X, olhando para -X"),
+            ('X_NEG', "-X", "Câmera no lado -X, olhando para +X"),
+            ('Y_POS', "+Y", "Câmera no lado +Y, olhando para -Y"),
+            ('Y_NEG', "-Y", "Câmera no lado -Y, olhando para +Y"),
+        ],
+        default='Y_NEG',
+    )
+
     def execute(self, context):
         camera = context.scene.camera
         if camera is None or camera.type != 'CAMERA':
@@ -602,7 +614,6 @@ class MINIATURE_OT_frame_camera(bpy.types.Operator):
             (min(zs) + max(zs)) / 2.0,
         ))
 
-        # 8 cantos do AABB
         corners = [
             Vector((x, y, z))
             for x in (min(xs), max(xs))
@@ -610,54 +621,81 @@ class MINIATURE_OT_frame_camera(bpy.types.Operator):
             for z in (min(zs), max(zs))
         ]
 
-        # 2. FOV horizontal da câmera
-        cam_data = camera.data
-        render = context.scene.render
-        aspect = render.resolution_x / render.resolution_y
+        # 2. Direção de visão → sistema de coordenadas da câmera
+        #
+        # look_dir  : direção de câmera → alvo (normalizada)
+        # cam_z     = -look_dir          (câmera aponta ao longo de -Z local)
+        # cam_x     = normalize(look_dir × world_up)   (eixo horizontal, à direita)
+        # cam_y     = normalize(cam_z × cam_x)          (eixo vertical, sempre = world +Z
+        #                                                 para vistas puramente laterais)
+        #
+        # A matriz de rotação tem cam_x, cam_y, cam_z como COLUNAS
+        # (eixos locais expressos em espaço mundo).
 
-        # Largura efetiva do sensor no eixo horizontal, em função do sensor_fit
-        sw = cam_data.sensor_width
-        sh = cam_data.sensor_height
-        fl = cam_data.lens  # distância focal em mm
+        look_dirs = {
+            'X_POS': Vector((-1.0,  0.0, 0.0)),
+            'X_NEG': Vector(( 1.0,  0.0, 0.0)),
+            'Y_POS': Vector(( 0.0, -1.0, 0.0)),
+            'Y_NEG': Vector(( 0.0,  1.0, 0.0)),
+        }
+        look_dir  = look_dirs[self.view_axis]
+        world_up  = Vector((0.0, 0.0, 1.0))
+
+        cam_z = -look_dir
+        cam_x = look_dir.cross(world_up).normalized()
+        cam_y = cam_z.cross(cam_x).normalized()
+
+        # 3. FOV horizontal
+        cam_data = camera.data
+        render   = context.scene.render
+        aspect   = render.resolution_x / render.resolution_y
+        sw, sh, fl = cam_data.sensor_width, cam_data.sensor_height, cam_data.lens
 
         if cam_data.sensor_fit == 'VERTICAL':
             eff_sw = sh * aspect
         elif cam_data.sensor_fit == 'AUTO':
             eff_sw = sw if aspect >= 1.0 else sh * aspect
-        else:  # HORIZONTAL
+        else:
             eff_sw = sw
 
         h_fov = 2.0 * math.atan(eff_sw / (2.0 * fl))
 
-        # 3. Vetores da câmera em espaço mundo
-        cam_mat = camera.matrix_world
-        cam_forward = -cam_mat.col[2].to_3d().normalized()  # câmera aponta -Z local
-        cam_right   =  cam_mat.col[0].to_3d().normalized()  # eixo horizontal da câmera
-
-        # 4. Extensão horizontal do AABB projetada no eixo direito da câmera
-        right_vals = [c.dot(cam_right) for c in corners]
+        # 4. Extensão horizontal do AABB no eixo cam_x
+        right_vals = [c.dot(cam_x) for c in corners]
         half_w = (max(right_vals) - min(right_vals)) / 2.0
 
         if half_w < 1e-9:
             self.report({'ERROR'}, "Bounding box com largura zero na direção da câmera.")
             return {'CANCELLED'}
 
-        # 5. Distância necessária:  fill = half_w / (D * tan(h_fov/2))  →  D = half_w / (fill * tan(h_fov/2))
+        # 5. Distância:  D = half_w / (fill * tan(h_fov/2))
         fill = self.fill_percent / 100.0
         D = half_w / (fill * math.tan(h_fov / 2.0))
 
-        # 6. Posicionar a câmera: centro do bbox recuado D unidades contra cam_forward.
-        #    A orientação (rotation) não é tocada.
-        camera.location = bbox_center - cam_forward * D
+        # 6. Posição: bbox_center recuado D unidades ao longo de look_dir
+        camera.location = bbox_center - look_dir * D
+
+        # 7. Rotação: matriz com cam_x, cam_y, cam_z como colunas
+        rot_mat = Matrix((cam_x, cam_y, cam_z)).transposed()
+        mode = camera.rotation_mode
+        if mode == 'QUATERNION':
+            camera.rotation_quaternion = rot_mat.to_quaternion()
+        elif mode == 'AXIS_ANGLE':
+            axis, angle = rot_mat.to_quaternion().to_axis_angle()
+            camera.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
+        else:
+            camera.rotation_euler = rot_mat.to_euler(mode)
 
         self.report(
             {'INFO'},
-            f"Câmera a {D:.3f} u do centro  |  FOV H: {math.degrees(h_fov):.1f}°  |  Fill: {self.fill_percent:.0f}%"
+            f"Câmera {self.view_axis} | D: {D:.3f} u | FOV H: {math.degrees(h_fov):.1f}° | Fill: {self.fill_percent:.0f}%"
         )
         return {'FINISHED'}
 
     def invoke(self, context, _event):
-        self.fill_percent = context.scene.miniature_camera_fill
+        scene = context.scene
+        self.fill_percent = scene.miniature_camera_fill
+        self.view_axis    = scene.miniature_camera_axis
         return self.execute(context)
 
 
@@ -758,12 +796,14 @@ class MINIATURE_PT_panel(bpy.types.Panel):
             box_cam.label(text="Sem câmera ativa na cena", icon='ERROR')
 
         box_cam.prop(scene, "miniature_camera_fill")
+        box_cam.prop(scene, "miniature_camera_axis", expand=True)
 
         row_cam = box_cam.row()
         row_cam.scale_y = 1.4
         row_cam.enabled = cam is not None
         op_cam = row_cam.operator("miniature.frame_camera", icon='CAMERA_DATA')
         op_cam.fill_percent = scene.miniature_camera_fill
+        op_cam.view_axis   = scene.miniature_camera_axis
 
         layout.separator()
 
@@ -858,6 +898,17 @@ _scene_props = [
         max=99.0,
         precision=1,
         subtype='PERCENTAGE',
+    )),
+    ("miniature_camera_axis", bpy.props.EnumProperty(
+        name="Eixo / Lado",
+        description="Lado a partir do qual a câmera verá as miniaturas",
+        items=[
+            ('X_POS', "+X", "Câmera no lado +X, olhando para -X"),
+            ('X_NEG', "-X", "Câmera no lado -X, olhando para +X"),
+            ('Y_POS', "+Y", "Câmera no lado +Y, olhando para -Y"),
+            ('Y_NEG', "-Y", "Câmera no lado -Y, olhando para +Y"),
+        ],
+        default='Y_NEG',
     )),
 ]
 
