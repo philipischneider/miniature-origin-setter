@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Miniature Origin Setter",
     "author": "philipischneider",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Miniature",
     "description": (
@@ -374,6 +374,10 @@ class MINIATURE_OT_distribute(bpy.types.Operator):
             self.report({'ERROR'}, "Selecione pelo menos 2 meshes para distribuir.")
             return {'CANCELLED'}
 
+        if self.axis == 'XY':
+            self.report({'ERROR'}, "Distribuir requer um único eixo (X ou Y). Use X+Y apenas para Centralizar.")
+            return {'CANCELLED'}
+
         # Garantir que matrix_world está atualizado antes de qualquer leitura de vértices.
         # O Blender avalia o depsgraph de forma lazy; sem isso, objetos movidos pelo
         # operador anterior ainda teriam matrix_world desatualizados.
@@ -441,6 +445,93 @@ class MINIATURE_OT_distribute(bpy.types.Operator):
         self.axis = scene.miniature_distribute_axis
         self.gap = scene.miniature_distribute_gap
         self.start_pos = scene.miniature_distribute_start
+        return self.execute(context)
+
+
+# ---------------------------------------------------------------------------
+# Operator – centralizar conjunto na origem do mundo
+# ---------------------------------------------------------------------------
+
+class MINIATURE_OT_center_at_origin(bpy.types.Operator):
+    """
+    Move todos os meshes selecionados de forma que o centro do bounding box
+    combinado de suas bases fique em 0 no eixo escolhido.
+    Todos os objetos se deslocam pelo mesmo delta, preservando posições relativas.
+    """
+    bl_idname = "miniature.center_at_origin"
+    bl_label = "Centralizar na Origem"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    base_height: bpy.props.FloatProperty(
+        name="Altura da Base",
+        description=(
+            "Altura a partir do limite inferior considerada para calcular "
+            "o bounding box da base."
+        ),
+        default=5.0,
+        min=0.0001,
+        soft_max=50.0,
+        precision=3,
+        unit='LENGTH',
+    )
+
+    axis: bpy.props.EnumProperty(
+        name="Eixo",
+        description="Eixo no qual o conjunto será centralizado em 0",
+        items=[
+            ('X', "X", "Centralizar ao longo do eixo X"),
+            ('Y', "Y", "Centralizar ao longo do eixo Y"),
+            ('XY', "X e Y", "Centralizar em ambos os eixos simultaneamente"),
+        ],
+        default='X',
+    )
+
+    def execute(self, context):
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        targets = [o for o in context.selected_objects if o.type == 'MESH']
+        if not targets:
+            self.report({'ERROR'}, "Nenhum mesh selecionado.")
+            return {'CANCELLED'}
+
+        context.view_layer.update()
+
+        axes = ['X', 'Y'] if self.axis == 'XY' else [self.axis]
+
+        for ax in axes:
+            axis_idx = 0 if ax == 'X' else 1
+
+            # Calcular o bounding box combinado de todas as bases no eixo
+            global_min = float('inf')
+            global_max = float('-inf')
+
+            valid_objects = []
+            for obj in targets:
+                ext = get_base_extent_1d(obj, self.base_height, ax)
+                if ext is None:
+                    continue
+                global_min = min(global_min, ext[0])
+                global_max = max(global_max, ext[1])
+                valid_objects.append(obj)
+
+            if not valid_objects:
+                continue
+
+            # Delta para que o centro do conjunto fique em 0
+            center = (global_min + global_max) / 2.0
+            delta = -center
+
+            for obj in valid_objects:
+                obj.location[axis_idx] += delta
+
+        self.report({'INFO'}, f"Conjunto centralizado em {self.axis} = 0.")
+        return {'FINISHED'}
+
+    def invoke(self, context, _event):
+        scene = context.scene
+        self.base_height = scene.miniature_base_height
+        self.axis = scene.miniature_distribute_axis
         return self.execute(context)
 
 
@@ -519,6 +610,12 @@ class MINIATURE_PT_panel(bpy.types.Panel):
         op_dist.gap = scene.miniature_distribute_gap
         op_dist.start_pos = scene.miniature_distribute_start
 
+        row2 = box_dist.row()
+        row2.scale_y = 1.4
+        op_ctr = row2.operator("miniature.center_at_origin", icon='PIVOT_CURSOR')
+        op_ctr.base_height = scene.miniature_base_height
+        op_ctr.axis = scene.miniature_distribute_axis
+
         layout.separator()
 
         # --- Info do objeto ativo ---
@@ -574,10 +671,11 @@ _scene_props = [
     )),
     ("miniature_distribute_axis", bpy.props.EnumProperty(
         name="Eixo",
-        description="Eixo ao longo do qual as miniaturas serão distribuídas",
+        description="Eixo para distribuição e centralização",
         items=[
-            ('X', "X", "Distribuir ao longo do eixo X"),
-            ('Y', "Y", "Distribuir ao longo do eixo Y"),
+            ('X',  "X",    "Eixo X"),
+            ('Y',  "Y",    "Eixo Y"),
+            ('XY', "X+Y",  "Ambos os eixos (só para centralizar)"),
         ],
         default='X',
     )),
@@ -606,6 +704,7 @@ _classes = [
     MINIATURE_OT_set_origin,
     MINIATURE_OT_set_origin_multipart,
     MINIATURE_OT_distribute,
+    MINIATURE_OT_center_at_origin,
     MINIATURE_PT_panel,
 ]
 
