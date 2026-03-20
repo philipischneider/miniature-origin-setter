@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Miniature Origin Setter",
     "author": "philipischneider",
-    "version": (1, 3, 0),
+    "version": (1, 4, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Miniature",
     "description": (
@@ -10,6 +10,8 @@ bl_info = {
     ),
     "category": "Object",
 }
+
+import math
 
 import bpy
 import bmesh
@@ -536,6 +538,130 @@ class MINIATURE_OT_center_at_origin(bpy.types.Operator):
 
 
 # ---------------------------------------------------------------------------
+# Operator – enquadrar câmera
+# ---------------------------------------------------------------------------
+
+class MINIATURE_OT_frame_camera(bpy.types.Operator):
+    """
+    Posiciona a câmera ativa para que as miniaturas selecionadas ocupem a
+    porcentagem especificada da largura horizontal da imagem.
+    A orientação da câmera é preservada; apenas a posição (location) é alterada.
+    """
+    bl_idname = "miniature.frame_camera"
+    bl_label = "Enquadrar Câmera"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    fill_percent: bpy.props.FloatProperty(
+        name="Preenchimento Horizontal",
+        description=(
+            "Porcentagem da largura da imagem que as miniaturas devem ocupar. "
+            "Ex.: 80 → as miniaturas ocupam 80 % da largura do frame."
+        ),
+        default=80.0,
+        min=1.0,
+        max=99.0,
+        precision=1,
+        subtype='PERCENTAGE',
+    )
+
+    def execute(self, context):
+        camera = context.scene.camera
+        if camera is None or camera.type != 'CAMERA':
+            self.report({'ERROR'}, "Nenhuma câmera ativa na cena.")
+            return {'CANCELLED'}
+
+        if camera.data.type == 'ORTHO':
+            self.report({'ERROR'}, "Câmera ortográfica não é suportada.")
+            return {'CANCELLED'}
+
+        targets = [o for o in context.selected_objects if o.type == 'MESH']
+        if not targets:
+            self.report({'ERROR'}, "Nenhum mesh selecionado.")
+            return {'CANCELLED'}
+
+        context.view_layer.update()
+
+        # 1. Bounding box 3D unificado de todos os meshes (espaço mundo)
+        all_verts = []
+        for obj in targets:
+            m = obj.matrix_world
+            for v in obj.data.vertices:
+                all_verts.append(m @ v.co)
+
+        if not all_verts:
+            self.report({'ERROR'}, "Meshes sem vértices.")
+            return {'CANCELLED'}
+
+        xs = [v.x for v in all_verts]
+        ys = [v.y for v in all_verts]
+        zs = [v.z for v in all_verts]
+
+        bbox_center = Vector((
+            (min(xs) + max(xs)) / 2.0,
+            (min(ys) + max(ys)) / 2.0,
+            (min(zs) + max(zs)) / 2.0,
+        ))
+
+        # 8 cantos do AABB
+        corners = [
+            Vector((x, y, z))
+            for x in (min(xs), max(xs))
+            for y in (min(ys), max(ys))
+            for z in (min(zs), max(zs))
+        ]
+
+        # 2. FOV horizontal da câmera
+        cam_data = camera.data
+        render = context.scene.render
+        aspect = render.resolution_x / render.resolution_y
+
+        # Largura efetiva do sensor no eixo horizontal, em função do sensor_fit
+        sw = cam_data.sensor_width
+        sh = cam_data.sensor_height
+        fl = cam_data.lens  # distância focal em mm
+
+        if cam_data.sensor_fit == 'VERTICAL':
+            eff_sw = sh * aspect
+        elif cam_data.sensor_fit == 'AUTO':
+            eff_sw = sw if aspect >= 1.0 else sh * aspect
+        else:  # HORIZONTAL
+            eff_sw = sw
+
+        h_fov = 2.0 * math.atan(eff_sw / (2.0 * fl))
+
+        # 3. Vetores da câmera em espaço mundo
+        cam_mat = camera.matrix_world
+        cam_forward = -cam_mat.col[2].to_3d().normalized()  # câmera aponta -Z local
+        cam_right   =  cam_mat.col[0].to_3d().normalized()  # eixo horizontal da câmera
+
+        # 4. Extensão horizontal do AABB projetada no eixo direito da câmera
+        right_vals = [c.dot(cam_right) for c in corners]
+        half_w = (max(right_vals) - min(right_vals)) / 2.0
+
+        if half_w < 1e-9:
+            self.report({'ERROR'}, "Bounding box com largura zero na direção da câmera.")
+            return {'CANCELLED'}
+
+        # 5. Distância necessária:  fill = half_w / (D * tan(h_fov/2))  →  D = half_w / (fill * tan(h_fov/2))
+        fill = self.fill_percent / 100.0
+        D = half_w / (fill * math.tan(h_fov / 2.0))
+
+        # 6. Posicionar a câmera: centro do bbox recuado D unidades contra cam_forward.
+        #    A orientação (rotation) não é tocada.
+        camera.location = bbox_center - cam_forward * D
+
+        self.report(
+            {'INFO'},
+            f"Câmera a {D:.3f} u do centro  |  FOV H: {math.degrees(h_fov):.1f}°  |  Fill: {self.fill_percent:.0f}%"
+        )
+        return {'FINISHED'}
+
+    def invoke(self, context, _event):
+        self.fill_percent = context.scene.miniature_camera_fill
+        return self.execute(context)
+
+
+# ---------------------------------------------------------------------------
 # Panel
 # ---------------------------------------------------------------------------
 
@@ -621,6 +747,26 @@ class MINIATURE_PT_panel(bpy.types.Panel):
 
         layout.separator()
 
+        # ── Seção: Câmera ────────────────────────────────────────────────────
+        box_cam = layout.box()
+        box_cam.label(text="Enquadrar Câmera", icon='CAMERA_DATA')
+
+        cam = context.scene.camera
+        if cam:
+            box_cam.label(text=f"Câmera ativa: {cam.name}", icon='CHECKMARK')
+        else:
+            box_cam.label(text="Sem câmera ativa na cena", icon='ERROR')
+
+        box_cam.prop(scene, "miniature_camera_fill")
+
+        row_cam = box_cam.row()
+        row_cam.scale_y = 1.4
+        row_cam.enabled = cam is not None
+        op_cam = row_cam.operator("miniature.frame_camera", icon='CAMERA_DATA')
+        op_cam.fill_percent = scene.miniature_camera_fill
+
+        layout.separator()
+
         # --- Info do objeto ativo ---
         if obj is None:
             layout.label(text="Nenhum objeto ativo", icon='ERROR')
@@ -701,6 +847,18 @@ _scene_props = [
         precision=3,
         unit='LENGTH',
     )),
+    ("miniature_camera_fill", bpy.props.FloatProperty(
+        name="Preenchimento Horizontal",
+        description=(
+            "Porcentagem da largura da imagem que as miniaturas devem ocupar. "
+            "Ex.: 80 → as miniaturas ocupam 80 % da largura do frame."
+        ),
+        default=80.0,
+        min=1.0,
+        max=99.0,
+        precision=1,
+        subtype='PERCENTAGE',
+    )),
 ]
 
 _classes = [
@@ -708,6 +866,7 @@ _classes = [
     MINIATURE_OT_set_origin_multipart,
     MINIATURE_OT_distribute,
     MINIATURE_OT_center_at_origin,
+    MINIATURE_OT_frame_camera,
     MINIATURE_PT_panel,
 ]
 
