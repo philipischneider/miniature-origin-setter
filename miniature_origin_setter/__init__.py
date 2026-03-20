@@ -374,41 +374,62 @@ class MINIATURE_OT_distribute(bpy.types.Operator):
             self.report({'ERROR'}, "Selecione pelo menos 2 meshes para distribuir.")
             return {'CANCELLED'}
 
-        ax = self.axis.lower()  # 'x' ou 'y'
+        # Garantir que matrix_world está atualizado antes de qualquer leitura de vértices.
+        # O Blender avalia o depsgraph de forma lazy; sem isso, objetos movidos pelo
+        # operador anterior ainda teriam matrix_world desatualizados.
+        context.view_layer.update()
 
-        # Ordenar pela posição atual no eixo escolhido
-        sorted_objects = sorted(targets, key=lambda o: getattr(o.location, ax))
-
-        # Calcular extents de base para cada objeto
-        extents = {}
-        for obj in sorted_objects:
+        # ── Fase 1: calcular todos os extents ANTES de mover qualquer objeto ──────
+        # Armazena: bbox_min, bbox_max (espaço mundo) e world_origin no eixo.
+        # Capturar world_origin via matrix_world.translation é mais robusto do que
+        # obj.location quando o objeto tem parent ou escala não-aplicada.
+        data = {}
+        for obj in targets:
             ext = get_base_extent_1d(obj, self.base_height, self.axis)
             if ext is None:
                 self.report({'WARNING'}, f"'{obj.name}': mesh vazio, ignorado.")
                 continue
-            extents[obj.name] = ext
+            axis_idx = 0 if self.axis == 'X' else 1
+            world_origin = obj.matrix_world.translation[axis_idx]
+            data[obj.name] = {
+                'obj': obj,
+                'bbox_min': ext[0],
+                'bbox_max': ext[1],
+                'width': ext[1] - ext[0],
+                # offset estrutural: distância fixa entre a origem e o bbox_min,
+                # independente de onde o objeto estiver posicionado.
+                'offset': ext[0] - world_origin,
+            }
 
-        # Posicionar cada objeto de forma que os bboxes fiquem adjacentes + gap
-        # offset = distância em espaço mundo entre a origem e o limite mínimo do bbox
-        # Mover obj.location[ax] por (delta) desloca os vértices pelo mesmo delta,
-        # independentemente de rotação/escala (sem parent), porque é translação global.
+        if not data:
+            self.report({'ERROR'}, "Nenhum objeto válido para distribuir.")
+            return {'CANCELLED'}
+
+        # ── Fase 2: ordenar pelo bbox_min atual (mais intuitivo que por origin) ──
+        sorted_data = sorted(data.values(), key=lambda d: d['bbox_min'])
+
+        # ── Fase 3: posicionar — apenas leitura de 'offset' e 'width', sem reuso ─
+        # Para cada objeto, queremos:   new_bbox_min = current_edge
+        # Sabemos que:                  new_bbox_min = new_world_origin + offset
+        # Logo:                         new_world_origin = current_edge - offset
+        #
+        # Para objetos sem parent: world_origin == obj.location[ax], então basta
+        # atribuir diretamente.  Com parent, convertemos via diferença de delta.
         current_edge = self.start_pos
         placed = 0
 
-        for obj in sorted_objects:
-            if obj.name not in extents:
-                continue
+        for d in sorted_data:
+            obj = d['obj']
+            axis_idx = 0 if self.axis == 'X' else 1
 
-            bbox_min, bbox_max = extents[obj.name]
-            bbox_width = bbox_max - bbox_min
+            new_world_origin = current_edge - d['offset']
+            # Calcular o delta em espaço mundo e aplicar à location local.
+            # Isso funciona com ou sem parent, com qualquer escala/rotação.
+            current_world_origin = obj.matrix_world.translation[axis_idx]
+            delta = new_world_origin - current_world_origin
+            obj.location[axis_idx] += delta
 
-            origin_pos = getattr(obj.location, ax)
-            offset = bbox_min - origin_pos          # bbox_min relativo à origem
-
-            new_origin_pos = current_edge - offset  # faz bbox_min = current_edge
-            setattr(obj.location, ax, new_origin_pos)
-
-            current_edge += bbox_width + self.gap
+            current_edge += d['width'] + self.gap
             placed += 1
 
         self.report({'INFO'}, f"{placed} miniatura(s) distribuída(s) ao longo de {self.axis}.")
