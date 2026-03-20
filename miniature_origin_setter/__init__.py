@@ -602,11 +602,14 @@ class MINIATURE_PT_panel(bpy.types.Panel):
 
         box_dist.prop(scene, "miniature_distribute_axis", expand=True)
 
+        # Distribuir só faz sentido em um único eixo — desabilitar quando XY
+        dist_axis = scene.miniature_distribute_axis
         row = box_dist.row()
         row.scale_y = 1.4
+        row.enabled = dist_axis != 'XY'
         op_dist = row.operator("miniature.distribute", icon='SNAP_INCREMENT')
         op_dist.base_height = scene.miniature_base_height
-        op_dist.axis = scene.miniature_distribute_axis
+        op_dist.axis = dist_axis if dist_axis != 'XY' else 'X'  # nunca passa 'XY' ao enum
         op_dist.gap = scene.miniature_distribute_gap
         op_dist.start_pos = scene.miniature_distribute_start
 
@@ -614,7 +617,7 @@ class MINIATURE_PT_panel(bpy.types.Panel):
         row2.scale_y = 1.4
         op_ctr = row2.operator("miniature.center_at_origin", icon='PIVOT_CURSOR')
         op_ctr.base_height = scene.miniature_base_height
-        op_ctr.axis = scene.miniature_distribute_axis
+        op_ctr.axis = dist_axis
 
         layout.separator()
 
